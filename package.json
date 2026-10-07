@@ -7,7 +7,7 @@
     "start": "node api/index.js"
   },
   "dependencies": {
-    "@whiskeysockets/baileys": "^6.7.9",
+    "@whiskeysockets/baileys": "6.7.18",
     "@hapi/boom": "^10.0.1",
     "express": "^4.19.2",
     "pino": "^9.4.0",
